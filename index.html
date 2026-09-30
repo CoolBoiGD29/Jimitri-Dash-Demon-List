@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Jimitri Demon List</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>👹</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+
+<div class="topbar">
+  <div class="logo">JIMITRI DEMON LIST</div>
+  <button class="ghost" id="btnLb">Leaderboard</button>
+  <div id="authArea"></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active main" data-list="main" id="tabMain">MAIN LIST</div>
+  <div class="tab ext" data-list="ext" id="tabExt">EXTENDED LIST</div>
+</div>
+<div class="grid" id="grid"></div>
+<div class="rowflex" style="padding:14px">
+  <button id="btnSubmitRecord">Submit Record</button>
+  <button id="btnSubmitVerif" class="ghost">Submit Verification</button>
+  <button id="btnAdmin" class="ghost" style="display:none">Admin Panel</button>
+</div>
+
+<div class="modalbg" id="mLevel"><div class="modal" id="mLevelBody"></div></div>
+<div class="modalbg" id="mLb"><div class="modal"><span class="close" id="closeLb">&times;</span><h2>Leaderboard</h2><div id="lbBody"></div></div></div>
+<div class="modalbg" id="mAuth"><div class="modal"><span class="close" id="closeAuth">&times;</span><div id="authBody"></div></div></div>
+<div class="modalbg" id="mRecord"><div class="modal"><span class="close" id="closeRecord">&times;</span><h2>Submit Record</h2><div id="recordBody"></div></div></div>
+<div class="modalbg" id="mVerif"><div class="modal"><span class="close" id="closeVerif">&times;</span><h2>Submit Verification</h2><div id="verifBody"></div></div></div>
+<div class="modalbg" id="mAdmin"><div class="modal" style="max-width:720px"><span class="close" id="closeAdmin">&times;</span><h2>Admin Panel</h2><div id="adminBody"></div></div></div>
+
+<div class="toast" id="toast"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
