@@ -150,6 +150,11 @@ function openLevel(id) {
     <h2>#${l.position} ${esc(l.name)} <span style="color:var(--sub);font-size:14px">(${l.points} pts)</span></h2>
     <p><b>Creator:</b> ${esc(l.creator)} &nbsp; <b>Verifier:</b> ${esc(l.verifier)}</p>
     ${videoEmbed(l.video)}
+    <div class="section"><h3>Level code</h3>
+    ${l.code ? `<textarea id="lvlCode" rows="2" readonly style="resize:vertical">${esc(l.code)}</textarea>
+      <div class="rowflex"><button class="small" id="btnCopyCode">Copy code</button></div>`
+      : '<div class="empty">No level code was saved for this level.</div>'}
+    </div>
     <div class="section"><h3>Records (${recs.length})</h3>
     ${recs.length ? recs.map(r => `<div class="rec"><span>${esc(r.username)}</span><span>${r.percent}%</span></div>`).join('') : '<div class="empty">No approved records yet.</div>'}
     </div>
@@ -157,6 +162,10 @@ function openLevel(id) {
   `;
   $('mLevel').classList.add('open');
   $('closeLevel').onclick = () => $('mLevel').classList.remove('open');
+  if (l.code) $('btnCopyCode').onclick = async () => {
+    try { await navigator.clipboard.writeText(l.code); toast('Code copied!'); }
+    catch (e) { $('lvlCode').select(); toast('Select and press Ctrl+C to copy.'); }
+  };
   if (isAdmin()) $('btnRemoveLevel').onclick = async () => {
     if (!confirm('Remove "' + l.name + '" from the list?')) return;
     await deleteDoc(doc(fs, 'levels', id));
