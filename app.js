@@ -1,37 +1,36 @@
 import { firebaseConfig } from './firebase-config.js';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  onAuthStateChanged, signOut
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, getDoc,
-  addDoc, onSnapshot, writeBatch, serverTimestamp
+  getDocs, query, where, addDoc, onSnapshot, writeBatch, serverTimestamp
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const fs = getFirestore(app);
+// Real usernames don't satisfy Firebase's "must be an email" requirement, so we
+// build a fake, never-contacted address from the username behind the scenes.
+// Users only ever see/type their username — this is invisible to them.
+const FAKE_DOMAIN = '@jimitridemonlist.invalid';
+const toEmail = u => u.trim().toLowerCase() + FAKE_DOMAIN;
 
 /* ---------- state ---------- */
-let STATE = { users: {}, levels: [], records: [], verifications: [] };
-let CUR = null; // logged-in app username (custom auth, separate from Firebase anon auth)
+let STATE = { users: {}, levels: [], records: [], verifications: [] }; // STATE.users is keyed by uid
 let ready = false;
 const $ = id => document.getElementById(id);
 function toast(m) { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 3000); }
 
-/* ---------- crypto ---------- */
-async function hashPass(pass, salt) {
-  const enc = new TextEncoder().encode(salt + ':' + pass);
-  const buf = await crypto.subtle.digest('SHA-256', enc);
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-function randSalt() { return crypto.getRandomValues(new Uint32Array(4)).join('-'); }
-
 /* ---------- points ---------- */
 function pointsFor(position) { return Math.round(250 - (position - 1) * (245 / 149)); }
 function levelById(id) { return STATE.levels.find(l => l.id === id); }
-function userPoints(username) {
+function userPoints(uid) {
   const byLevel = {};
   for (const r of STATE.records) {
-    if (r.status !== 'approved' || r.username !== username) continue;
+    if (r.status !== 'approved' || r.uid !== uid) continue;
     const lvl = levelById(r.level); if (!lvl) continue;
     const pct = Math.max(0, Math.min(100, r.percent));
     const pts = Math.round(lvl.points * pct / 100);
@@ -41,64 +40,73 @@ function userPoints(username) {
 }
 
 /* ---------- Firestore live sync ---------- */
-function watch(name, target) {
+function watchCollection(name) {
   onSnapshot(collection(fs, name), snap => {
-    if (Array.isArray(target())) {
-      const arr = []; snap.forEach(d => arr.push({ id: d.id, ...d.data() })); STATE[name] = arr;
+    if (name === 'users') {
+      const obj = {}; snap.forEach(d => obj[d.id] = { uid: d.id, ...d.data() }); STATE.users = obj;
     } else {
-      const obj = {}; snap.forEach(d => obj[d.id] = { username: d.id, ...d.data() }); STATE[name] = obj;
+      const arr = []; snap.forEach(d => arr.push({ id: d.id, ...d.data() })); STATE[name] = arr;
     }
     if (ready) render();
   }, err => toast('Sync error (' + name + '): ' + err.message));
 }
 
+let CLAIMS = { admin: false, staff: false }; // from the signed Firebase ID token — this is what Firestore rules actually trust
 async function boot() {
-  try { await signInAnonymously(auth); }
-  catch (e) { toast('Could not connect to Firebase: ' + e.message + ' — check firebase-config.js and that Anonymous sign-in is enabled.'); return; }
-  onAuthStateChanged(auth, u => { if (!u) return; });
-  watch('users', () => STATE.users);
-  watch('levels', () => STATE.levels);
-  watch('records', () => STATE.records);
-  watch('verifications', () => STATE.verifications);
-  const s = loadSession();
-  if (s) { const d = await getDoc(doc(fs, 'users', s)); if (d.exists() && !d.data().banned) CUR = s; }
+  watchCollection('users');
+  watchCollection('levels');
+  watchCollection('records');
+  watchCollection('verifications');
+  onAuthStateChanged(auth, async user => {
+    if (user) { const t = await user.getIdTokenResult(); CLAIMS = { admin: !!t.claims.admin, staff: !!t.claims.staff }; }
+    else CLAIMS = { admin: false, staff: false };
+    if (ready) render();
+  });
   ready = true;
   render();
 }
 
-/* ---------- session (which app-username this browser is logged in as) ---------- */
-function saveSession(u) { try { localStorage.setItem('jdl_session', u); } catch (e) {} }
-function loadSession() { try { return localStorage.getItem('jdl_session'); } catch (e) { return null; } }
+/* ---------- auth ----------
+   isStaff()/isAdmin() check the REAL server-verified token claims (CLAIMS), set only by
+   scripts/set-role.js. The Firestore "role" field on a user doc is just a display label
+   kept in sync by that script — permissions never come from that field. */
+function currentUser() { const u = auth.currentUser; return u ? STATE.users[u.uid] : null; }
+function isStaff() { return !!auth.currentUser && CLAIMS.staff; }
+function isAdmin() { return !!auth.currentUser && CLAIMS.admin; }
 
-/* ---------- auth ---------- */
-function currentUser() { return CUR ? STATE.users[CUR] : null; }
-function isStaff() { const u = currentUser(); return u && (u.role === 'admin' || u.role === 'mod'); }
-function isAdmin() { const u = currentUser(); return u && u.role === 'admin'; }
+async function usernameTaken(username) {
+  const q = query(collection(fs, 'users'), where('username', '==', username));
+  const snap = await getDocs(q);
+  return !snap.empty;
+}
 
 async function signup(username, pass) {
   username = username.trim();
-  if (username.length < 3) return 'Username must be at least 3 characters.';
-  if (STATE.users[username]) return 'That username is taken.';
-  if (pass.length < 4) return 'Password must be at least 4 characters.';
-  const salt = randSalt();
-  const hash = await hashPass(pass, salt);
+  if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) return 'Username must be 3-20 characters: letters, numbers, underscore only.';
+  if (pass.length < 6) return 'Password must be at least 6 characters.';
+  if (await usernameTaken(username)) return 'That username is taken.';
+  let cred;
+  try { cred = await createUserWithEmailAndPassword(auth, toEmail(username), pass); }
+  catch (e) { return friendlyAuthError(e); }
   const isFirst = Object.keys(STATE.users).length === 0;
-  await setDoc(doc(fs, 'users', username), { salt, hash, role: isFirst ? 'admin' : 'user', banned: false, created: serverTimestamp() });
-  CUR = username; saveSession(username);
+  try {
+    await setDoc(doc(fs, 'users', cred.user.uid), { username, role: 'user', banned: false, created: serverTimestamp() });
+  } catch (e) { return 'Account created but profile setup failed: ' + e.message; }
+  if (isFirst) toast('Account created! You are the first user — ask an operator to grant you admin via scripts/set-role.js, then log out and back in.');
+  else toast('Account created!');
   return null;
 }
 async function login(username, pass) {
-  username = username.trim();
-  const snap = await getDoc(doc(fs, 'users', username));
-  if (!snap.exists()) return 'No such user.';
-  const u = snap.data();
-  if (u.banned) return 'This account is banned.';
-  const hash = await hashPass(pass, u.salt);
-  if (hash !== u.hash) return 'Wrong password.';
-  CUR = username; saveSession(username);
-  return null;
+  try { await signInWithEmailAndPassword(auth, toEmail(username.trim()), pass); return null; }
+  catch (e) { return friendlyAuthError(e); }
 }
-function logout() { CUR = null; saveSession(''); render(); }
+function friendlyAuthError(e) {
+  if (['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found'].includes(e.code)) return 'Wrong username or password.';
+  if (e.code === 'auth/email-already-in-use') return 'That username is taken.';
+  if (e.code === 'auth/too-many-requests') return 'Too many attempts — wait a bit and try again.';
+  return e.message;
+}
+function logout() { signOut(auth); }
 
 /* ---------- rendering ---------- */
 let curList = 'main';
@@ -108,9 +116,9 @@ function render() {
 }
 function renderAuth() {
   const el = $('authArea'); const u = currentUser();
-  if (!u) { el.innerHTML = '<button id="btnLogin">Sign up / Log in</button>'; $('btnLogin').onclick = openAuth; return; }
+  if (!auth.currentUser || !u) { el.innerHTML = '<button id="btnLogin">Sign up / Log in</button>'; $('btnLogin').onclick = openAuth; return; }
   const roleClass = u.role === 'admin' ? 'role-admin' : (u.role === 'mod' ? 'role-mod' : '');
-  el.innerHTML = `<div class="userpill"><b class="${roleClass}">${esc(CUR)}</b><span style="color:var(--sub)">${userPoints(CUR)} pts</span></div><button class="ghost small" id="btnLogout">Log out</button>`;
+  el.innerHTML = `<div class="userpill"><b class="${roleClass}">${esc(u.username)}</b><span style="color:var(--sub)">${userPoints(u.uid)} pts</span></div><button class="ghost small" id="btnLogout">Log out</button>`;
   $('btnLogout').onclick = logout;
 }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -156,7 +164,7 @@ function openLevel(id) {
       : '<div class="empty">No level code was saved for this level.</div>'}
     </div>
     <div class="section"><h3>Records (${recs.length})</h3>
-    ${recs.length ? recs.map(r => `<div class="rec"><span>${esc(r.username)}</span><span>${r.percent}%</span></div>`).join('') : '<div class="empty">No approved records yet.</div>'}
+    ${recs.length ? recs.map(r => `<div class="rec"><span>${esc(STATE.users[r.uid] ? STATE.users[r.uid].username : r.username || '?')}</span><span>${r.percent}%</span></div>`).join('') : '<div class="empty">No approved records yet.</div>'}
     </div>
     ${isAdmin() ? `<div class="section"><button class="danger small" id="btnRemoveLevel">Remove from list (hack verified)</button></div>` : ''}
   `;
@@ -176,7 +184,7 @@ $('mLevel').onclick = e => { if (e.target === $('mLevel')) $('mLevel').classList
 
 /* ---------- leaderboard ---------- */
 $('btnLb').onclick = () => {
-  const rows = Object.values(STATE.users).filter(u => !u.banned).map(u => ({ u: u.username, p: userPoints(u.username), role: u.role })).sort((a, b) => b.p - a.p);
+  const rows = Object.values(STATE.users).filter(u => !u.banned).map(u => ({ u: u.username, p: userPoints(u.uid), role: u.role })).sort((a, b) => b.p - a.p);
   $('lbBody').innerHTML = rows.length ? rows.map((r, i) => `<div class="lb-row"><span>#${i + 1} ${esc(r.u)} ${r.role !== 'user' ? '<span class="badge">' + r.role + '</span>' : ''}</span><b>${r.p} pts</b></div>`).join('') : '<div class="empty">No users yet.</div>';
   $('mLb').classList.add('open');
 };
@@ -196,11 +204,13 @@ function openAuth() {
   $('modeSignup').onclick = () => { mode = 'signup'; $('authGo').textContent = 'Sign up'; };
   $('modeLogin').onclick = () => { mode = 'login'; $('authGo').textContent = 'Log in'; };
   $('authGo').onclick = async () => {
+    $('authGo').disabled = true;
     const u = $('authUser').value, p = $('authPass').value;
     const err = mode === 'signup' ? await signup(u, p) : await login(u, p);
+    $('authGo').disabled = false;
     const m = $('authMsg');
     if (err) { m.className = 'msg err'; m.textContent = err; }
-    else { $('mAuth').classList.remove('open'); toast(mode === 'signup' ? 'Account created!' : 'Logged in.'); render(); }
+    else { $('mAuth').classList.remove('open'); render(); }
   };
   $('mAuth').classList.add('open');
 }
@@ -224,7 +234,8 @@ $('btnSubmitRecord').onclick = () => {
     if (!level) { m.className = 'msg err'; m.textContent = 'Pick a level.'; return; }
     if (!pct || pct < 1 || pct > 100) { m.className = 'msg err'; m.textContent = 'Progress must be 1-100.'; return; }
     if (!evid) { m.className = 'msg err'; m.textContent = 'Evidence link is required.'; return; }
-    await addDoc(collection(fs, 'records'), { level, username: CUR, percent: pct, evidence: evid, note, status: 'pending', created: serverTimestamp() });
+    const me = currentUser();
+    await addDoc(collection(fs, 'records'), { level, uid: me.uid, username: me.username, percent: pct, evidence: evid, note, status: 'pending', created: serverTimestamp() });
     $('mRecord').classList.remove('open'); toast('Record submitted for review.');
   };
   $('mRecord').classList.add('open');
@@ -247,7 +258,8 @@ $('btnSubmitVerif').onclick = () => {
     const name = $('vName').value.trim(), code = $('vCode').value.trim(), creator = $('vCreator').value.trim(), evid = $('vEvid').value.trim(), note = $('vNote').value.trim();
     const m = $('vMsg');
     if (!name || !code || !creator || !evid) { m.className = 'msg err'; m.textContent = 'Name, code, creator and evidence are required.'; return; }
-    await addDoc(collection(fs, 'verifications'), { name, code, creator, video: evid, note, submitter: CUR, status: 'pending', created: serverTimestamp() });
+    const me = currentUser();
+    await addDoc(collection(fs, 'verifications'), { name, code, creator, video: evid, note, uid: me.uid, submitter: me.username, status: 'pending', created: serverTimestamp() });
     $('mVerif').classList.remove('open'); toast('Verification submitted for review.');
   };
   $('mVerif').classList.add('open');
@@ -272,10 +284,9 @@ function renderAdmin() {
       <span><button class="small" data-act="verif-approve" data-id="${v.id}">Approve</button> <button class="small danger" data-act="verif-reject" data-id="${v.id}">Reject</button></span></div>`).join('') : '<div class="empty">None</div>';
 
   html += '<h3>Users</h3>' + Object.values(STATE.users).map(u => `<div class="rec"><span>${esc(u.username)} <span class="badge">${u.role}</span>${u.banned ? ' <span class="badge rejected">banned</span>' : ''}</span>
-    <span>
-      ${isAdmin() && u.role !== 'admin' ? `<button class="small ghost" data-act="promote" data-id="${u.username}">${u.role === 'mod' ? 'Demote' : 'Promote to mod'}</button>` : ''}
-      ${isAdmin() && u.username !== CUR ? `<button class="small danger" data-act="ban" data-id="${u.username}">${u.banned ? 'Unban' : 'Ban'}</button>` : ''}
-    </span></div>`).join('');
+    <span style="font-size:11px;color:var(--sub)">uid: ${u.uid}</span></div>`).join('');
+  html += `<div class="msg ok" style="margin-top:8px">Promote, demote, and ban are done with the scripts/set-role.js tool (for promote/demote) and the banned switch below is still app-side for quick moderation — ban/unban stays available here; role changes require the script so they're server-verified.</div>`;
+  html += Object.values(STATE.users).filter(u => isAdmin() && u.uid !== auth.currentUser.uid).map(u => `<div class="rec"><span>${esc(u.username)}</span><button class="small danger" data-act="ban" data-id="${u.uid}">${u.banned ? 'Unban' : 'Ban'}</button></div>`).join('');
 
   $('adminBody').innerHTML = html;
   $('adminBody').querySelectorAll('button[data-act]').forEach(b => {
@@ -300,11 +311,10 @@ function renderAdmin() {
         batch.set(newRef, { name: v.name, creator: v.creator, verifier: v.submitter, video: v.video, code: v.code, position: pos, points: pointsFor(pos) });
         batch.update(doc(fs, 'verifications', id), { status: 'approved' });
         const recRef = doc(collection(fs, 'records'));
-        batch.set(recRef, { level: newRef.id, username: v.submitter, percent: 100, evidence: v.video, note: 'auto: verification', status: 'approved', created: serverTimestamp() });
+        batch.set(recRef, { level: newRef.id, uid: v.uid, username: v.submitter, percent: 100, evidence: v.video, note: 'auto: verification', status: 'approved', created: serverTimestamp() });
         await batch.commit();
       }
       if (act === 'ban') await updateDoc(doc(fs, 'users', id), { banned: !STATE.users[id].banned });
-      if (act === 'promote') await updateDoc(doc(fs, 'users', id), { role: STATE.users[id].role === 'mod' ? 'user' : 'mod' });
       renderAdmin();
     };
   });
