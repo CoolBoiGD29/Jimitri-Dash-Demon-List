@@ -1,326 +1,169 @@
 import { firebaseConfig } from './firebase-config.js';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-import {
-  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
-  onAuthStateChanged, signOut
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import {
-  getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, getDoc,
-  getDocs, query, where, addDoc, onSnapshot, writeBatch, serverTimestamp
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import { getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, getDocs, query, where, addDoc, onSnapshot, writeBatch, serverTimestamp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const fs = getFirestore(app);
-// Real usernames don't satisfy Firebase's "must be an email" requirement, so we
-// build a fake, never-contacted address from the username behind the scenes.
-// Users only ever see/type their username — this is invisible to them.
-const FAKE_DOMAIN = '@jimitridemonlist.invalid';
-const toEmail = u => u.trim().toLowerCase() + FAKE_DOMAIN;
+import { initCommunity } from './community.js';
 
-/* ---------- state ---------- */
-let STATE = { users: {}, levels: [], records: [], verifications: [] }; // STATE.users is keyed by uid
-let ready = false;
-const $ = id => document.getElementById(id);
-function toast(m) { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 3000); }
+/* ====== EASY SETTINGS ====== */
+const GAME_URL = './game/'; // the game folder inside this repo (use the full original URL here if you don't host a copy)
+const MAX_VIDEOS = 5;                                                 // tutorial video limit
+/* =========================== */
 
-/* ---------- points ---------- */
-function pointsFor(position) { return Math.round(250 - (position - 1) * (245 / 149)); }
-function levelById(id) { return STATE.levels.find(l => l.id === id); }
-function userPoints(uid) {
-  const byLevel = {};
-  for (const r of STATE.records) {
-    if (r.status !== 'approved' || r.uid !== uid) continue;
-    const lvl = levelById(r.level); if (!lvl) continue;
-    const pct = Math.max(0, Math.min(100, r.percent));
-    const pts = Math.round(lvl.points * pct / 100);
-    if (!byLevel[r.level] || byLevel[r.level] < pts) byLevel[r.level] = pts;
-  }
-  return Object.values(byLevel).reduce((a, b) => a + b, 0);
-}
+const app = initializeApp(firebaseConfig), auth = getAuth(app), fs = getFirestore(app);
+const toEmail = u => u.trim().toLowerCase() + '@jimitridemonlist.invalid'; // hidden; users only see usernames
 
-/* ---------- Firestore live sync ---------- */
-function watchCollection(name) {
-  onSnapshot(collection(fs, name), snap => {
-    if (name === 'users') {
-      const obj = {}; snap.forEach(d => obj[d.id] = { uid: d.id, ...d.data() }); STATE.users = obj;
-    } else {
-      const arr = []; snap.forEach(d => arr.push({ id: d.id, ...d.data() })); STATE[name] = arr;
-    }
-    if (ready) render();
-  }, err => toast('Sync error (' + name + '): ' + err.message));
-}
-
-let CLAIMS = { admin: false, staff: false }; // from the signed Firebase ID token — this is what Firestore rules actually trust
-async function boot() {
-  watchCollection('users');
-  watchCollection('levels');
-  watchCollection('records');
-  watchCollection('verifications');
-  onAuthStateChanged(auth, async user => {
-    if (user) { const t = await user.getIdTokenResult(); CLAIMS = { admin: !!t.claims.admin, staff: !!t.claims.staff }; }
-    else CLAIMS = { admin: false, staff: false };
-    if (ready) render();
-  });
-  ready = true;
+const S = { users: {}, admins: {}, staff: {}, levels: [], records: [], verifications: [], mods: [], tutorials: [] };
+const keyed = ['users', 'admins', 'staff'];
+for (const n of Object.keys(S)) onSnapshot(collection(fs, n), snap => {
+  if (keyed.includes(n)) { const o = {}; snap.forEach(d => o[d.id] = { uid: d.id, ...d.data() }); S[n] = o; }
+  else { const a = []; snap.forEach(d => a.push({ id: d.id, ...d.data() })); S[n] = a; }
   render();
-}
+}, e => toast(n + ': ' + e.message));
+onAuthStateChanged(auth, () => render());
 
-/* ---------- auth ----------
-   isStaff()/isAdmin() check the REAL server-verified token claims (CLAIMS), set only by
-   scripts/set-role.js. The Firestore "role" field on a user doc is just a display label
-   kept in sync by that script — permissions never come from that field. */
-function currentUser() { const u = auth.currentUser; return u ? STATE.users[u.uid] : null; }
-function isStaff() { return !!auth.currentUser && CLAIMS.staff; }
-function isAdmin() { return !!auth.currentUser && CLAIMS.admin; }
+/* ---------- helpers ---------- */
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const safe = u => /^https?:\/\//i.test(u) ? u : '#';
+const toast = m => { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 3500); };
+const modal = h => { $('modalBody').style.maxWidth = ''; $('modalBody').innerHTML = '<span class="close" data-act="close">&times;</span>' + h; $('modal').classList.add('open'); };
+const closeModal = () => $('modal').classList.remove('open');
+const msg = (id, t, ok) => { const m = $(id); m.className = 'msg ' + (ok ? 'ok' : 'err'); m.textContent = t; };
+const copy = async (t, ok) => { try { await navigator.clipboard.writeText(t); toast(ok); } catch (e) { prompt('Copy this:', t); } };
+const pointsFor = p => Math.round(250 - (p - 1) * (245 / 149));
+const lvl = id => S.levels.find(l => l.id === id);
+const ytId = u => (String(u).match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/) || [])[1];
+const embed = u => ytId(u) ? `<iframe src="https://www.youtube.com/embed/${ytId(u)}" allowfullscreen></iframe>` : (/^https?:/i.test(u) ? `<video src="${esc(u)}" controls></video>` : '<div class="empty">No video</div>');
+const userPts = u => { const b = {}; for (const r of S.records) { if (r.status !== 'approved' || r.uid !== u) continue; const l = lvl(r.level); if (!l) continue; const p = Math.round(l.points * Math.min(100, Math.max(0, r.percent)) / 100); if (!(b[r.level] >= p)) b[r.level] = p; } return Object.values(b).reduce((a, c) => a + c, 0); };
+const uid = () => auth.currentUser && auth.currentUser.uid;
+const me = () => S.users[uid()];
+const isAdmin = () => !!(uid() && S.admins[uid()]);
+const isStaff = () => isAdmin() || !!(uid() && S.staff[uid()]);
+const pending = () => S.records.filter(r => r.status === 'pending').length + S.verifications.filter(v => v.status === 'pending').length + S.mods.filter(m => m.status === 'pending').length + (S.community || []).filter(c => c.status === 'pending').length;
+const need = () => { if (me()) return true; toast('Log in first.'); acts['open-auth'](); return false; };
 
-async function usernameTaken(username) {
-  const q = query(collection(fs, 'users'), where('username', '==', username));
-  const snap = await getDocs(q);
-  return !snap.empty;
-}
+/* mods use the same share-code format as the Jimitri Mod Loader */
+const modObj = m => { let code = m.code; try { if (code.trim().startsWith('{')) { const j = JSON.parse(code); if (j.code) code = j.code; } } catch (e) {}
+  return { format: 1, id: (m.name || 'mod').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'mod', name: m.name, version: m.version || '1.0.0', author: m.author, description: m.description || '', code }; };
+const SAME_ORIGIN = new URL(GAME_URL, location.href).origin === location.origin; // true when the game is hosted next to this site
+const shareCode = m => 'JDMOD:' + btoa(unescape(encodeURIComponent(JSON.stringify(modObj(m)))));
 
-async function signup(username, pass) {
-  username = username.trim();
-  if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) return 'Username must be 3-20 characters: letters, numbers, underscore only.';
-  if (pass.length < 6) return 'Password must be at least 6 characters.';
-  if (await usernameTaken(username)) return 'That username is taken.';
-  let cred;
-  try { cred = await createUserWithEmailAndPassword(auth, toEmail(username), pass); }
-  catch (e) { return friendlyAuthError(e); }
-  const isFirst = Object.keys(STATE.users).length === 0;
-  try {
-    await setDoc(doc(fs, 'users', cred.user.uid), { username, role: 'user', banned: false, created: serverTimestamp() });
-  } catch (e) { return 'Account created but profile setup failed: ' + e.message; }
-  if (isFirst) toast('Account created! You are the first user — ask an operator to grant you admin via scripts/set-role.js, then log out and back in.');
-  else toast('Account created!');
-  return null;
-}
-async function login(username, pass) {
-  try { await signInWithEmailAndPassword(auth, toEmail(username.trim()), pass); return null; }
-  catch (e) { return friendlyAuthError(e); }
-}
-function friendlyAuthError(e) {
-  if (['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found'].includes(e.code)) return 'Wrong username or password.';
-  if (e.code === 'auth/email-already-in-use') return 'That username is taken.';
-  if (e.code === 'auth/too-many-requests') return 'Too many attempts — wait a bit and try again.';
-  return e.message;
-}
-function logout() { signOut(auth); }
-
-/* ---------- rendering ---------- */
-let curList = 'main';
+/* ---------- views ---------- */
+let tab = 'home', listTab = 'main';
+const TABS = [['home', 'Home'], ['play', 'Play'], ['list', 'Demon List'], ['mods', 'Mods'], ['tutorials', 'Tutorials'], ['leaderboard', 'Leaderboard']];
+const views = {
+  home: () => `<div class="card"><h2>Welcome to Jimitri Hub</h2><p>A fan-made home for Jimitri Dash: play the game, climb the demon list, grab community mods, and learn to build levels.</p>
+    <div class="rowflex"><a href="#play"><button>Play</button></a><a href="#list"><button class="ghost">Demon List</button></a><a href="#mods"><button class="ghost">Mods</button></a><a href="#tutorials"><button class="ghost">Tutorials</button></a></div></div>
+    <div class="card"><h2>Credits</h2><p><b>turkball</b> created Jimitri Dash.<br><b>specta</b> gave me the idea to remake this site.<br>This is an unofficial fan site.</p></div>`,
+  play: () => `<div class="pad"><iframe class="gamebox" src="${esc(GAME_URL)}" allow="fullscreen; autoplay"></iframe>
+    <p class="sub">Game not loading? <a href="${esc(GAME_URL)}" target="_blank" rel="noopener">Open it in its own tab</a>. Log in inside the game (ACCOUNT button) to upload levels.</p></div>`,
+  list: () => { const all = [...S.levels].sort((a, b) => a.position - b.position), L = listTab === 'main' ? all.filter(l => l.position <= 75) : all.filter(l => l.position > 75);
+    return `<div class="tabs"><div class="tab main ${listTab === 'main' ? 'active' : ''}" data-act="ltab" data-id="main">MAIN LIST</div><div class="tab ext ${listTab === 'ext' ? 'active' : ''}" data-act="ltab" data-id="ext">EXTENDED LIST</div></div>
+    <div class="grid">${L.length ? L.map(l => `<div class="lvl ${l.position <= 75 ? 'main' : 'ext'}" data-act="lvl" data-id="${l.id}"><div class="ic">#${l.position}</div><small>${esc(l.name)}</small></div>`).join('') : '<div class="empty">No levels here yet.</div>'}</div>
+    <div class="rowflex pad"><button data-act="rec-form">Submit Record</button><button class="ghost" data-act="ver-form">Submit Verification</button></div>`; },
+  mods: () => { const L = S.mods.filter(m => m.status === 'approved');
+    return `<div class="rowflex pad"><button data-act="mod-form">Submit a mod</button></div><div class="cards">${L.length ? L.map(m => `<div class="card"><h3>${esc(m.name)} <small class="sub">v${esc(m.version)}</small></h3><p class="sub">by ${esc(m.author)}</p><p>${esc(m.description)}</p>
+      <div class="rowflex"><button class="small" data-act="copy-mod" data-id="${m.id}">Copy share code</button>${SAME_ORIGIN ? `<button class="small" data-act="inst-mod" data-id="${m.id}">Install to game</button>` : ''}<button class="small ghost" data-act="dl-mod" data-id="${m.id}">Download .jdmod</button>${isStaff() ? `<button class="small danger" data-act="mod-del" data-id="${m.id}">Delete</button>` : ''}</div></div>`).join('') : '<div class="empty" style="grid-column:1/-1">No approved mods yet.</div>'}</div>
+    <p class="sub pad">To install: press Install to game, then reload the game. (Or open the game, click MODS, then IMPORT CODE with a share code.) Only install mods you trust.</p>`; },
+  tutorials: () => { const L = [...S.tutorials].sort((a, b) => (a.order || 0) - (b.order || 0));
+    return `${isAdmin() ? `<div class="rowflex pad"><button data-act="vid-form" ${L.length >= MAX_VIDEOS ? 'disabled' : ''}>Add video (${L.length}/${MAX_VIDEOS})</button></div>` : ''}
+    <div class="cards">${L.length ? L.map(t => `<div class="card"><h3>${esc(t.title)}</h3>${embed(t.url)}${isAdmin() ? `<div class="rowflex"><button class="small danger" data-act="vid-del" data-id="${t.id}">Remove</button></div>` : ''}</div>`).join('') : '<div class="empty" style="grid-column:1/-1">Tutorials coming soon: level creation, triggers, custom blocks, and effects.</div>'}</div>`; },
+  leaderboard: () => { const R = Object.values(S.users).filter(u => !u.banned).map(u => ({ n: u.username, p: userPts(u.uid), id: u.uid })).sort((a, b) => b.p - a.p);
+    return `<div class="pad"><h2>Leaderboard</h2>${R.length ? R.map((r, i) => `<div class="lb-row"><span>#${i + 1} ${esc(r.n)} ${S.admins[r.id] ? '<span class="badge">admin</span>' : S.staff[r.id] ? '<span class="badge">mod</span>' : ''}</span><b>${r.p} pts</b></div>`).join('') : '<div class="empty">No players yet.</div>'}</div>`; },
+  admin: () => { if (!isStaff()) return '<div class="empty">Staff only.</div>';
+    const pr = S.records.filter(r => r.status === 'pending'), pv = S.verifications.filter(v => v.status === 'pending'), pm = S.mods.filter(m => m.status === 'pending');
+    const row = (t, a, id, extra = '') => `<div class="rec"><span>${t}</span><span>${extra}<button class="small" data-act="${a}-ok" data-id="${id}">Approve</button> <button class="small danger" data-act="${a}-no" data-id="${id}">Reject</button></span></div>`;
+    const none = '<div class="empty">None</div>';
+    let h = `<div class="pad"><h2>Pending records (${pr.length})</h2>` + (pr.map(r => row(`${esc(r.username)}: ${esc(lvl(r.level) ? lvl(r.level).name : '?')} ${r.percent}% <a href="${esc(safe(r.evidence))}" target="_blank" rel="noopener">evidence</a>${r.note ? ' “' + esc(r.note) + '”' : ''}`, 'rec', r.id)).join('') || none)
+      + `<h2>Pending verifications (${pv.length})</h2>` + (pv.map(v => row(`${esc(v.name)} by ${esc(v.creator)}, verified by ${esc(v.submitter)} <a href="${esc(safe(v.video))}" target="_blank" rel="noopener">evidence</a>${v.note ? ' “' + esc(v.note) + '”' : ''}`, 'ver', v.id)).join('') || none)
+      + `<h2>Pending mods (${pm.length})</h2><p class="sub">Read the code before approving. Approved mods run inside players' browsers.</p>` + (pm.map(m => row(`${esc(m.name)} v${esc(m.version)} by ${esc(m.author)}`, 'mod', m.id, `<button class="small ghost" data-act="mod-view" data-id="${m.id}">View code</button> `)).join('') || none);
+    if (isAdmin()) h += '<h2>Users</h2>' + Object.values(S.users).map(u => `<div class="rec"><span>${esc(u.username)} ${S.admins[u.uid] ? '<span class="badge">admin</span>' : S.staff[u.uid] ? '<span class="badge">mod</span>' : ''}${u.banned ? ' <span class="badge rejected">banned</span>' : ''}</span>
+      <span>${S.admins[u.uid] ? '' : `<button class="small ghost" data-act="staff" data-id="${u.uid}">${S.staff[u.uid] ? 'Remove mod' : 'Make mod'}</button> <button class="small danger" data-act="ban" data-id="${u.uid}">${u.banned ? 'Unban' : 'Ban'}</button>`}</span></div>`).join('');
+    return h + '</div>'; }
+};
 function render() {
-  renderAuth(); renderGrid();
-  $('btnAdmin').style.display = isStaff() ? 'inline-block' : 'none';
+  $('nav').innerHTML = TABS.map(([k, n]) => `<a href="#${k}" class="${tab === k ? 'on' : ''}">${n}</a>`).join('') + (isStaff() ? `<a href="#admin" class="${tab === 'admin' ? 'on' : ''}">Admin${pending() ? ' (' + pending() + ')' : ''}</a>` : '');
+  const u = me();
+  $('authArea').innerHTML = auth.currentUser && u ? `<div class="userpill"><b class="${isAdmin() ? 'role-admin' : isStaff() ? 'role-mod' : ''}">${esc(u.username)}</b><span class="sub">${userPts(u.uid)} pts</span></div><button class="ghost small" data-act="logout">Log out</button>` : '<button data-act="open-auth">Sign up / Log in</button>';
+  $('view').innerHTML = (views[tab] || views.home)();
 }
-function renderAuth() {
-  const el = $('authArea'); const u = currentUser();
-  if (!auth.currentUser || !u) { el.innerHTML = '<button id="btnLogin">Sign up / Log in</button>'; $('btnLogin').onclick = openAuth; return; }
-  const roleClass = u.role === 'admin' ? 'role-admin' : (u.role === 'mod' ? 'role-mod' : '');
-  el.innerHTML = `<div class="userpill"><b class="${roleClass}">${esc(u.username)}</b><span style="color:var(--sub)">${userPoints(u.uid)} pts</span></div><button class="ghost small" id="btnLogout">Log out</button>`;
-  $('btnLogout').onclick = logout;
-}
-function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+addEventListener('hashchange', () => { tab = location.hash.slice(1) || 'home'; render(); scrollTo(0, 0); });
+tab = location.hash.slice(1) || 'home';
 
-function renderGrid() {
-  const grid = $('grid');
-  const main = STATE.levels.filter(l => l.position <= 75).sort((a, b) => a.position - b.position);
-  const ext = STATE.levels.filter(l => l.position > 75).sort((a, b) => a.position - b.position);
-  const list = curList === 'main' ? main : ext;
-  $('tabMain').classList.toggle('active', curList === 'main');
-  $('tabExt').classList.toggle('active', curList === 'ext');
-  if (!list.length) { grid.innerHTML = '<div class="empty">No levels here yet. Approve a verification in the Admin Panel to add one.</div>'; return; }
-  grid.innerHTML = '';
-  for (const l of list) {
-    const d = document.createElement('div');
-    d.className = 'lvl ' + (l.position <= 75 ? 'main' : 'ext');
-    d.innerHTML = `<div class="ic">#${l.position}</div><small>${esc(l.name)}</small>`;
-    d.onclick = () => openLevel(l.id);
-    grid.appendChild(d);
-  }
-}
-$('tabMain').onclick = () => { curList = 'main'; renderGrid(); };
-$('tabExt').onclick = () => { curList = 'ext'; renderGrid(); };
-
-function videoEmbed(url) {
-  if (!url) return '<div class="empty">No video provided</div>';
-  const yt = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/);
-  if (yt) return `<iframe src="https://www.youtube.com/embed/${yt[1]}" allowfullscreen></iframe>`;
-  return `<video src="${esc(url)}" controls></video>`;
-}
-
-function openLevel(id) {
-  const l = levelById(id); if (!l) return;
-  const recs = STATE.records.filter(r => r.level === id && r.status === 'approved').sort((a, b) => b.percent - a.percent);
-  $('mLevelBody').innerHTML = `
-    <span class="close" id="closeLevel">&times;</span>
-    <h2>#${l.position} ${esc(l.name)} <span style="color:var(--sub);font-size:14px">(${l.points} pts)</span></h2>
-    <p><b>Creator:</b> ${esc(l.creator)} &nbsp; <b>Verifier:</b> ${esc(l.verifier)}</p>
-    ${videoEmbed(l.video)}
-    <div class="section"><h3>Level code</h3>
-    ${l.code ? `<textarea id="lvlCode" rows="2" readonly style="resize:vertical">${esc(l.code)}</textarea>
-      <div class="rowflex"><button class="small" id="btnCopyCode">Copy code</button></div>`
-      : '<div class="empty">No level code was saved for this level.</div>'}
-    </div>
-    <div class="section"><h3>Records (${recs.length})</h3>
-    ${recs.length ? recs.map(r => `<div class="rec"><span>${esc(STATE.users[r.uid] ? STATE.users[r.uid].username : r.username || '?')}</span><span>${r.percent}%</span></div>`).join('') : '<div class="empty">No approved records yet.</div>'}
-    </div>
-    ${isAdmin() ? `<div class="section"><button class="danger small" id="btnRemoveLevel">Remove from list (hack verified)</button></div>` : ''}
-  `;
-  $('mLevel').classList.add('open');
-  $('closeLevel').onclick = () => $('mLevel').classList.remove('open');
-  if (l.code) $('btnCopyCode').onclick = async () => {
-    try { await navigator.clipboard.writeText(l.code); toast('Code copied!'); }
-    catch (e) { $('lvlCode').select(); toast('Select and press Ctrl+C to copy.'); }
-  };
-  if (isAdmin()) $('btnRemoveLevel').onclick = async () => {
-    if (!confirm('Remove "' + l.name + '" from the list?')) return;
-    await deleteDoc(doc(fs, 'levels', id));
-    $('mLevel').classList.remove('open'); toast('Level removed.');
-  };
-}
-$('mLevel').onclick = e => { if (e.target === $('mLevel')) $('mLevel').classList.remove('open'); };
-
-/* ---------- leaderboard ---------- */
-$('btnLb').onclick = () => {
-  const rows = Object.values(STATE.users).filter(u => !u.banned).map(u => ({ u: u.username, p: userPoints(u.uid), role: u.role })).sort((a, b) => b.p - a.p);
-  $('lbBody').innerHTML = rows.length ? rows.map((r, i) => `<div class="lb-row"><span>#${i + 1} ${esc(r.u)} ${r.role !== 'user' ? '<span class="badge">' + r.role + '</span>' : ''}</span><b>${r.p} pts</b></div>`).join('') : '<div class="empty">No users yet.</div>';
-  $('mLb').classList.add('open');
+/* ---------- actions ---------- */
+let authMode = 'signup';
+const setStatus = (col, id, status) => updateDoc(doc(fs, col, id), { status });
+const acts = {
+  close: closeModal,
+  ltab: id => { listTab = id; render(); },
+  logout: () => signOut(auth),
+  'open-auth': () => { authMode = 'signup'; modal(`<h2>Sign up / Log in</h2><div class="rowflex"><button class="small" data-act="auth-mode" data-id="signup">Sign up</button><button class="small ghost" data-act="auth-mode" data-id="login">Log in</button></div>
+    <label>Username (3-20 letters, numbers, _)</label><input id="aUser"><label>Password (6+ characters)</label><input id="aPass" type="password"><div class="rowflex"><button id="aGo" data-act="auth-go">Sign up</button></div><div id="aMsg"></div>`); },
+  'auth-mode': id => { authMode = id; $('aGo').textContent = id === 'signup' ? 'Sign up' : 'Log in'; },
+  'auth-go': async () => {
+    const name = $('aUser').value.trim(), pass = $('aPass').value;
+    try {
+      if (authMode === 'signup') {
+        if (!/^[a-zA-Z0-9_]{3,20}$/.test(name)) return msg('aMsg', 'Username must be 3-20 letters, numbers or _.');
+        if (pass.length < 6) return msg('aMsg', 'Password must be at least 6 characters.');
+        if (!(await getDocs(query(collection(fs, 'users'), where('username', '==', name)))).empty) return msg('aMsg', 'That username is taken.');
+        const c = await createUserWithEmailAndPassword(auth, toEmail(name), pass);
+        await setDoc(doc(fs, 'users', c.user.uid), { username: name, banned: false, created: serverTimestamp() });
+      } else await signInWithEmailAndPassword(auth, toEmail(name), pass);
+      closeModal(); toast(authMode === 'signup' ? 'Account created!' : 'Logged in.');
+    } catch (e) { msg('aMsg', ['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found'].includes(e.code) ? 'Wrong username or password.' : e.code === 'auth/email-already-in-use' ? 'That username is taken.' : e.message); }
+  },
+  lvl: id => { const l = lvl(id); if (!l) return; const R = S.records.filter(r => r.level === id && r.status === 'approved').sort((a, b) => b.percent - a.percent);
+    modal(`<h2>#${l.position} ${esc(l.name)} <span class="sub">(${l.points} pts)</span></h2><p><b>Creator:</b> ${esc(l.creator)} &nbsp; <b>Verifier:</b> ${esc(l.verifier)}</p>${embed(l.video)}
+      <div class="section"><h3>Level code</h3>${l.code ? `<textarea readonly rows="2">${esc(l.code)}</textarea><div class="rowflex"><button class="small" data-act="copy-level" data-id="${l.id}">Copy code</button></div>` : '<div class="empty">No code saved.</div>'}</div>
+      <div class="section"><h3>Records (${R.length})</h3>${R.map(r => `<div class="rec"><span>${esc(S.users[r.uid] ? S.users[r.uid].username : r.username)}</span><span>${r.percent}%</span></div>`).join('') || '<div class="empty">No approved records yet.</div>'}</div>
+      ${isStaff() ? `<div class="section"><button class="danger small" data-act="lvl-del" data-id="${l.id}">Remove from list (hack verified)</button></div>` : ''}`); },
+  'copy-level': id => copy(lvl(id).code, 'Level code copied!'),
+  'lvl-del': async id => { if (confirm('Remove "' + lvl(id).name + '" from the list?')) { await deleteDoc(doc(fs, 'levels', id)); closeModal(); toast('Level removed.'); } },
+  'rec-form': () => { if (!need()) return; modal(`<h2>Submit Record</h2><label>Level</label><select id="rLevel">${[...S.levels].sort((a, b) => a.position - b.position).map(l => `<option value="${l.id}">#${l.position} ${esc(l.name)}</option>`).join('') || '<option value="">No levels yet</option>'}</select>
+    <label>Progress % (100 = completion)</label><input id="rPct" type="number" min="1" max="100" value="100"><label>Evidence (YouTube or video link)</label><input id="rEvid" placeholder="https://youtube.com/...">
+    <label>Note for mods (optional)</label><textarea id="rNote" rows="2"></textarea><div class="rowflex"><button data-act="rec-go">Submit</button></div><div id="fMsg"></div>`); },
+  'rec-go': async () => { const level = $('rLevel').value, p = +$('rPct').value, ev = $('rEvid').value.trim();
+    if (!level || !(p >= 1 && p <= 100) || !/^https?:\/\//i.test(ev)) return msg('fMsg', 'Pick a level, a progress from 1 to 100, and a link starting with http.');
+    await addDoc(collection(fs, 'records'), { level, uid: uid(), username: me().username, percent: Math.round(p), evidence: ev, note: $('rNote').value.trim().slice(0, 300), status: 'pending', created: serverTimestamp() }); closeModal(); toast('Record submitted for review.'); },
+  'ver-form': () => { if (!need()) return; modal(`<h2>Submit Verification</h2><label>Level name</label><input id="vName"><label>Level code</label><textarea id="vCode" rows="2"></textarea><label>Creator</label><input id="vCreator">
+    <label>Evidence (YouTube or video link)</label><input id="vEvid" placeholder="https://youtube.com/..."><label>Note for mods (optional)</label><textarea id="vNote" rows="2"></textarea><div class="rowflex"><button data-act="ver-go">Submit</button></div><div id="fMsg"></div>`); },
+  'ver-go': async () => { const name = $('vName').value.trim(), code = $('vCode').value.trim(), cr = $('vCreator').value.trim(), ev = $('vEvid').value.trim();
+    if (!name || !code || !cr || !/^https?:\/\//i.test(ev)) return msg('fMsg', 'Name, code, creator, and an http evidence link are required.');
+    await addDoc(collection(fs, 'verifications'), { name, code, creator: cr, video: ev, note: $('vNote').value.trim().slice(0, 300), uid: uid(), submitter: me().username, status: 'pending', created: serverTimestamp() }); closeModal(); toast('Verification submitted for review.'); },
+  'mod-form': () => { if (!need()) return; modal(`<h2>Submit a mod</h2><p class="sub">An admin reads and approves every mod before it appears.</p><label>Name</label><input id="mName"><label>Version</label><input id="mVer" value="1.0.0"><label>Description</label><textarea id="mDesc" rows="2"></textarea>
+    <label>Mod file (.js or .jdmod)</label><input id="mFile" type="file" accept=".js,.jdmod,.json"><label>...or paste the code</label><textarea id="mCode" rows="4"></textarea><div class="rowflex"><button data-act="mod-go">Submit</button></div><div id="fMsg"></div>`); },
+  'mod-go': async () => { const f = $('mFile').files[0]; const code = (f ? await f.text() : $('mCode').value).trim(), name = $('mName').value.trim();
+    if (!name || !code) return msg('fMsg', 'A name and a mod file or code are required.'); if (code.length > 99000) return msg('fMsg', 'That mod is too big (limit about 99 KB).');
+    await addDoc(collection(fs, 'mods'), { name: name.slice(0, 79), version: $('mVer').value.trim().slice(0, 20) || '1.0.0', description: $('mDesc').value.trim().slice(0, 300), code, uid: uid(), author: me().username, status: 'pending', created: serverTimestamp() }); closeModal(); toast('Mod submitted. An admin will review it.'); },
+  'copy-mod': id => copy(shareCode(S.mods.find(m => m.id === id)), 'Share code copied! Paste it into the mod loader.'),
+  'inst-mod': id => { const m = S.mods.find(x => x.id === id), o = modObj(m); if (!confirm('Install "' + o.name + '" into the game? It runs with full access to the game page.')) return;
+    let L = []; try { L = JSON.parse(localStorage.getItem('jdmods:v1') || '[]'); } catch (e) {}
+    L = L.filter(x => x.id !== o.id); L.push({ id: o.id, name: o.name, version: o.version, author: o.author, description: o.description, code: o.code, enabled: true });
+    localStorage.setItem('jdmods:v1', JSON.stringify(L)); toast('Installed! Reload the game to use it.'); },
+  'dl-mod': id => { const m = S.mods.find(x => x.id === id), o = modObj(m), a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(o, null, 2)], { type: 'application/json' })); a.download = o.id + '.jdmod'; a.click(); },
+  'mod-view': id => modal(`<h2>Code review</h2><textarea readonly rows="16" style="font-family:monospace">${esc(S.mods.find(m => m.id === id).code)}</textarea>`),
+  'mod-del': async id => { if (confirm('Delete this mod?')) await deleteDoc(doc(fs, 'mods', id)); },
+  'vid-form': () => modal(`<h2>Add tutorial video</h2><label>Title</label><input id="tTitle" placeholder="How triggers work"><label>YouTube link</label><input id="tUrl"><div class="rowflex"><button data-act="vid-go">Add</button></div><div id="fMsg"></div>`),
+  'vid-go': async () => { const t = $('tTitle').value.trim(), u = $('tUrl').value.trim(); if (!t || !ytId(u)) return msg('fMsg', 'Enter a title and a valid YouTube link.');
+    if (S.tutorials.length >= MAX_VIDEOS) return msg('fMsg', 'Video limit reached. Remove one first.'); await addDoc(collection(fs, 'tutorials'), { title: t.slice(0, 80), url: u, order: Date.now() }); closeModal(); },
+  'vid-del': async id => { if (confirm('Remove this video?')) await deleteDoc(doc(fs, 'tutorials', id)); },
+  'rec-ok': id => setStatus('records', id, 'approved'), 'rec-no': id => setStatus('records', id, 'rejected'),
+  'mod-ok': id => setStatus('mods', id, 'approved'), 'mod-no': id => setStatus('mods', id, 'rejected'),
+  'ver-no': id => setStatus('verifications', id, 'rejected'),
+  'ver-ok': async id => { const v = S.verifications.find(x => x.id === id); let pos = parseInt(prompt('Position on the list (1-150, 1 = hardest)?', '150'), 10); if (!pos || pos < 1 || pos > 150) pos = 150;
+    const b = writeBatch(fs); for (const l of S.levels) if (l.position >= pos) { const np = l.position + 1; np <= 150 ? b.update(doc(fs, 'levels', l.id), { position: np, points: pointsFor(np) }) : b.delete(doc(fs, 'levels', l.id)); }
+    const lr = doc(collection(fs, 'levels')); b.set(lr, { name: v.name, creator: v.creator, verifier: v.submitter, video: v.video, code: v.code, position: pos, points: pointsFor(pos) });
+    b.update(doc(fs, 'verifications', id), { status: 'approved' }); b.set(doc(collection(fs, 'records')), { level: lr.id, uid: v.uid, username: v.submitter, percent: 100, evidence: v.video, note: 'auto: verification', status: 'approved', created: serverTimestamp() }); await b.commit(); },
+  ban: id => updateDoc(doc(fs, 'users', id), { banned: !S.users[id].banned }),
+  staff: id => S.staff[id] ? deleteDoc(doc(fs, 'staff', id)) : setDoc(doc(fs, 'staff', id), { created: serverTimestamp() })
 };
-$('closeLb').onclick = () => $('mLb').classList.remove('open');
-$('mLb').onclick = e => { if (e.target === $('mLb')) $('mLb').classList.remove('open'); };
-
-/* ---------- auth modal ---------- */
-function openAuth() {
-  $('authBody').innerHTML = `
-    <h2>Sign up / Log in</h2>
-    <div class="rowflex"><button class="small" id="modeSignup">Sign up</button><button class="small ghost" id="modeLogin">Log in</button></div>
-    <label>Username</label><input id="authUser">
-    <label>Password</label><input id="authPass" type="password">
-    <div class="rowflex"><button id="authGo">Sign up</button></div>
-    <div id="authMsg"></div>`;
-  let mode = 'signup';
-  $('modeSignup').onclick = () => { mode = 'signup'; $('authGo').textContent = 'Sign up'; };
-  $('modeLogin').onclick = () => { mode = 'login'; $('authGo').textContent = 'Log in'; };
-  $('authGo').onclick = async () => {
-    $('authGo').disabled = true;
-    const u = $('authUser').value, p = $('authPass').value;
-    const err = mode === 'signup' ? await signup(u, p) : await login(u, p);
-    $('authGo').disabled = false;
-    const m = $('authMsg');
-    if (err) { m.className = 'msg err'; m.textContent = err; }
-    else { $('mAuth').classList.remove('open'); render(); }
-  };
-  $('mAuth').classList.add('open');
-}
-$('closeAuth').onclick = () => $('mAuth').classList.remove('open');
-$('mAuth').onclick = e => { if (e.target === $('mAuth')) $('mAuth').classList.remove('open'); };
-
-/* ---------- submit record ---------- */
-$('btnSubmitRecord').onclick = () => {
-  if (!currentUser()) { toast('Log in first.'); openAuth(); return; }
-  const opts = STATE.levels.slice().sort((a, b) => a.position - b.position).map(l => `<option value="${l.id}">#${l.position} ${esc(l.name)}</option>`).join('');
-  $('recordBody').innerHTML = `
-    <label>Level</label><select id="rLevel">${opts || '<option disabled>No levels yet</option>'}</select>
-    <label>Progress % (100 = completion)</label><input id="rPct" type="number" min="1" max="100" value="100">
-    <label>Evidence — video URL or YouTube link</label><input id="rEvid" placeholder="https://youtube.com/watch?v=...">
-    <label>Note for mods (optional)</label><textarea id="rNote" rows="2"></textarea>
-    <div class="rowflex"><button id="rGo">Submit</button></div>
-    <div id="rMsg"></div>`;
-  $('rGo').onclick = async () => {
-    const level = $('rLevel').value, pct = +$('rPct').value, evid = $('rEvid').value.trim(), note = $('rNote').value.trim();
-    const m = $('rMsg');
-    if (!level) { m.className = 'msg err'; m.textContent = 'Pick a level.'; return; }
-    if (!pct || pct < 1 || pct > 100) { m.className = 'msg err'; m.textContent = 'Progress must be 1-100.'; return; }
-    if (!evid) { m.className = 'msg err'; m.textContent = 'Evidence link is required.'; return; }
-    const me = currentUser();
-    await addDoc(collection(fs, 'records'), { level, uid: me.uid, username: me.username, percent: pct, evidence: evid, note, status: 'pending', created: serverTimestamp() });
-    $('mRecord').classList.remove('open'); toast('Record submitted for review.');
-  };
-  $('mRecord').classList.add('open');
-};
-$('closeRecord').onclick = () => $('mRecord').classList.remove('open');
-$('mRecord').onclick = e => { if (e.target === $('mRecord')) $('mRecord').classList.remove('open'); };
-
-/* ---------- submit verification ---------- */
-$('btnSubmitVerif').onclick = () => {
-  if (!currentUser()) { toast('Log in first.'); openAuth(); return; }
-  $('verifBody').innerHTML = `
-    <label>Level name</label><input id="vName">
-    <label>Level code</label><textarea id="vCode" rows="2" placeholder="Paste the level share code"></textarea>
-    <label>Creator</label><input id="vCreator">
-    <label>Evidence — video URL or YouTube link</label><input id="vEvid" placeholder="https://youtube.com/watch?v=...">
-    <label>Note for mods (optional)</label><textarea id="vNote" rows="2"></textarea>
-    <div class="rowflex"><button id="vGo">Submit</button></div>
-    <div id="vMsg"></div>`;
-  $('vGo').onclick = async () => {
-    const name = $('vName').value.trim(), code = $('vCode').value.trim(), creator = $('vCreator').value.trim(), evid = $('vEvid').value.trim(), note = $('vNote').value.trim();
-    const m = $('vMsg');
-    if (!name || !code || !creator || !evid) { m.className = 'msg err'; m.textContent = 'Name, code, creator and evidence are required.'; return; }
-    const me = currentUser();
-    await addDoc(collection(fs, 'verifications'), { name, code, creator, video: evid, note, uid: me.uid, submitter: me.username, status: 'pending', created: serverTimestamp() });
-    $('mVerif').classList.remove('open'); toast('Verification submitted for review.');
-  };
-  $('mVerif').classList.add('open');
-};
-$('closeVerif').onclick = () => $('mVerif').classList.remove('open');
-$('mVerif').onclick = e => { if (e.target === $('mVerif')) $('mVerif').classList.remove('open'); };
-
-/* ---------- admin panel ---------- */
-function renderAdmin() {
-  if (!isStaff()) return;
-  const pendingRecs = STATE.records.filter(r => r.status === 'pending');
-  const pendingVerifs = STATE.verifications.filter(v => v.status === 'pending');
-  let html = '<h3>Pending records (' + pendingRecs.length + ')</h3>';
-  html += pendingRecs.length ? pendingRecs.map(r => {
-    const lvl = levelById(r.level);
-    return `<div class="rec"><span>${esc(r.username)} — ${esc(lvl ? lvl.name : '?')} — ${r.percent}% — <a href="${esc(r.evidence)}" target="_blank">evidence</a>${r.note ? ' — "' + esc(r.note) + '"' : ''}</span>
-      <span><button class="small" data-act="rec-approve" data-id="${r.id}">Approve</button> <button class="small danger" data-act="rec-reject" data-id="${r.id}">Reject</button></span></div>`;
-  }).join('') : '<div class="empty">None</div>';
-
-  html += '<h3>Pending verifications (' + pendingVerifs.length + ')</h3>';
-  html += pendingVerifs.length ? pendingVerifs.map(v => `<div class="rec"><span>${esc(v.name)} by ${esc(v.creator)}, verified by ${esc(v.submitter)} — code: ${esc(v.code.slice(0, 24))}${v.code.length > 24 ? '…' : ''} — <a href="${esc(v.video)}" target="_blank">evidence</a>${v.note ? ' — "' + esc(v.note) + '"' : ''}</span>
-      <span><button class="small" data-act="verif-approve" data-id="${v.id}">Approve</button> <button class="small danger" data-act="verif-reject" data-id="${v.id}">Reject</button></span></div>`).join('') : '<div class="empty">None</div>';
-
-  html += '<h3>Users</h3>' + Object.values(STATE.users).map(u => `<div class="rec"><span>${esc(u.username)} <span class="badge">${u.role}</span>${u.banned ? ' <span class="badge rejected">banned</span>' : ''}</span>
-    <span style="font-size:11px;color:var(--sub)">uid: ${u.uid}</span></div>`).join('');
-  html += `<div class="msg ok" style="margin-top:8px">Promote, demote, and ban are done with the scripts/set-role.js tool (for promote/demote) and the banned switch below is still app-side for quick moderation — ban/unban stays available here; role changes require the script so they're server-verified.</div>`;
-  html += Object.values(STATE.users).filter(u => isAdmin() && u.uid !== auth.currentUser.uid).map(u => `<div class="rec"><span>${esc(u.username)}</span><button class="small danger" data-act="ban" data-id="${u.uid}">${u.banned ? 'Unban' : 'Ban'}</button></div>`).join('');
-
-  $('adminBody').innerHTML = html;
-  $('adminBody').querySelectorAll('button[data-act]').forEach(b => {
-    b.onclick = async () => {
-      const id = b.dataset.id, act = b.dataset.act;
-      if (act === 'rec-approve') await updateDoc(doc(fs, 'records', id), { status: 'approved' });
-      if (act === 'rec-reject') await updateDoc(doc(fs, 'records', id), { status: 'rejected' });
-      if (act === 'verif-reject') await updateDoc(doc(fs, 'verifications', id), { status: 'rejected' });
-      if (act === 'verif-approve') {
-        const v = STATE.verifications.find(x => x.id === id);
-        let pos = parseInt(prompt('Position on the list (1-150, 1 = hardest)?', '150'), 10);
-        if (!pos || pos < 1) pos = 150; if (pos > 150) pos = 150;
-        const batch = writeBatch(fs);
-        for (const l of STATE.levels) {
-          if (l.position >= pos) {
-            const newPos = l.position + 1;
-            if (newPos <= 150) batch.update(doc(fs, 'levels', l.id), { position: newPos, points: pointsFor(newPos) });
-            else batch.delete(doc(fs, 'levels', l.id));
-          }
-        }
-        const newRef = doc(collection(fs, 'levels'));
-        batch.set(newRef, { name: v.name, creator: v.creator, verifier: v.submitter, video: v.video, code: v.code, position: pos, points: pointsFor(pos) });
-        batch.update(doc(fs, 'verifications', id), { status: 'approved' });
-        const recRef = doc(collection(fs, 'records'));
-        batch.set(recRef, { level: newRef.id, uid: v.uid, username: v.submitter, percent: 100, evidence: v.video, note: 'auto: verification', status: 'approved', created: serverTimestamp() });
-        await batch.commit();
-      }
-      if (act === 'ban') await updateDoc(doc(fs, 'users', id), { banned: !STATE.users[id].banned });
-      renderAdmin();
-    };
-  });
-}
-$('closeAdmin').onclick = () => $('mAdmin').classList.remove('open');
-$('mAdmin').addEventListener('click', e => { if (e.target.id === 'mAdmin') $('mAdmin').classList.remove('open'); });
-$('btnAdmin').addEventListener('click', () => { $('mAdmin').classList.add('open'); renderAdmin(); });
-
-boot();
+document.addEventListener('click', async e => {
+  if (e.target.id === 'modal') return closeModal();
+  const el = e.target.closest('[data-act]'); if (!el || !acts[el.dataset.act]) return;
+  try { await acts[el.dataset.act](el.dataset.id, el); }
+  catch (err) { toast(err.code === 'permission-denied' ? 'Not allowed. Are you logged in, not banned, and approved for that?' : err.message); }
+});
+initCommunity({ S, views, acts, fs, TABS, render, modal, closeModal, toast, esc, safe, msg, me, uid, need, isAdmin, isStaff, GAME_URL });
+render();
